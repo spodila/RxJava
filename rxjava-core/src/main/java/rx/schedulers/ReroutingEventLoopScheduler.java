@@ -33,10 +33,12 @@ public class ReroutingEventLoopScheduler extends Scheduler {
         for(CoreThreadWorker worker: CoreThreadWorkers.INSTANCE.CORE_THREAD_WORKERS) {
             System.out.printf("%d: avgLatency=%10.2f  count=%d\n", worker.myIndex, worker.latencyCounts.getAverage(), worker.getCount());
         }
+        System.out.println("#Reroutes=" + CoreThreadWorkers.INSTANCE.numReroutes);
     }
 
     protected static class CoreThreadWorkers {
-        final AtomicLong counter = new AtomicLong();
+        final AtomicLong counter = new AtomicLong(0L);
+        private final AtomicLong numReroutes = new AtomicLong(0L);
         protected final CoreThreadWorker[] CORE_THREAD_WORKERS;
         protected final static int NUM_CORES = Runtime.getRuntime().availableProcessors();
         protected static final CoreThreadWorkers INSTANCE = new CoreThreadWorkers();
@@ -45,7 +47,7 @@ public class ReroutingEventLoopScheduler extends Scheduler {
         private AtomicBoolean canReroute = new AtomicBoolean(true);
         private int rerouter=-1;
         private long lastReroutingAt=0;
-        private final long ReroutingDelayIntervalMillis = 100;
+        private final long ReroutingDelayIntervalMillis = 20;
 
         private CoreThreadWorkers() {
             CORE_THREAD_WORKERS = new CoreThreadWorker[NUM_CORES];
@@ -63,10 +65,23 @@ public class ReroutingEventLoopScheduler extends Scheduler {
         }
 
         protected int getRerouteDestination(int from, double[] latencyValues) {
-            return -1;
+            int dest = -1;
+            int min=-1;
+            double minVal=0.0;
+            for(int i=0; i<latencyValues.length; i++) {
+                if(i==from)
+                    continue;
+                if(latencyValues[i] == 0)
+                    return i;
+                if(minVal>latencyValues[i]) {
+                    minVal = latencyValues[i];
+                    min = i;
+                }
+            }
+            return min;
         }
 
-        int shouldRerouteTo(int theWorker) {
+        int shouldReroute(int theWorker) {
             if(!canReroute.compareAndSet(true, false))
                 return -1;
             if(rerouter >= 0)
@@ -91,6 +106,7 @@ public class ReroutingEventLoopScheduler extends Scheduler {
             if(rerouter == theWorker) {
                 lastReroutingAt = System.currentTimeMillis();
                 rerouter = -1;
+                numReroutes.incrementAndGet();
             }
         }
 
@@ -104,7 +120,7 @@ public class ReroutingEventLoopScheduler extends Scheduler {
     private static class AverageOfN {
         private final int MAX_LATENCY_COUNTS=10;
         private List<Long> list = new ArrayList<Long>(MAX_LATENCY_COUNTS+1);
-        private long sum=0;
+        private double sum=0;
         void add(long val) {
             list.add(val);
             if(list.size()>=MAX_LATENCY_COUNTS) {
@@ -126,9 +142,10 @@ public class ReroutingEventLoopScheduler extends Scheduler {
         private volatile int counter = 0;
         private AverageOfN latencyCounts = new AverageOfN();
         //private List<Long> latencyCounts = new ArrayList<Long>(MAX_LATENCY_COUNTS+1);
-        private Map<Long, AverageOfN> queueCounts = new HashMap<Long, AverageOfN>();
-        private long latencyEvalInterval=100; // ToDo what's a good number?
-        private static final double EPS=0.25;
+        private Map<Long, AverageOfN> queueCountsHistory = new HashMap<Long, AverageOfN>();
+        private Map<Long, Integer> queueCounts = new HashMap<Long, Integer>();
+        private long latencyEvalInterval=40; // ToDo what's a good number?
+        private static final double EPS=0.02;
 
         CoreThreadWorker(final int index) {
             this.myIndex = index;
@@ -161,21 +178,31 @@ public class ReroutingEventLoopScheduler extends Scheduler {
                 @Override
                 public void run() {
                     latencyCounts.add(System.currentTimeMillis() - start);
-                    if(queueCounts.size()>1) {
+                    if(queueCounts.size()>1 || queueCountsHistory.size()>1) {
                         int q=0;
                         long maxQ=-1;
                         double max=0.0;
-                        for(Map.Entry<Long, AverageOfN> entry: queueCounts.entrySet()) {
-                            if(entry.getValue().getAverage()>EPS) {
+                        for(Map.Entry<Long, AverageOfN> entry: queueCountsHistory.entrySet()) {
+                            Integer qCount = queueCounts.remove(entry.getKey());
+                            entry.getValue().add((qCount == null)? 0L : qCount);
+                        }
+                        for(Map.Entry<Long, Integer> entry: queueCounts.entrySet()) {
+                            AverageOfN aon = new AverageOfN();
+                            aon.add(entry.getValue());
+                            queueCountsHistory.put(entry.getKey(), aon);
+                        }
+                        for(Map.Entry<Long, AverageOfN> entry: queueCountsHistory.entrySet()) {
+                            AverageOfN qAv = entry.getValue();
+                            if(qAv.getAverage()>EPS) {
                                 q++;
-                                if(entry.getValue().getAverage()>max) {
-                                    max = entry.getValue().getAverage();
+                                if(qAv.getAverage()>max) {
+                                    max = qAv.getAverage();
                                     maxQ = entry.getKey();
                                 }
                             }
                         }
                         if(q>1) {
-                            int dest = CoreThreadWorkers.INSTANCE.shouldRerouteTo(myIndex);
+                            int dest = CoreThreadWorkers.INSTANCE.shouldReroute(myIndex);
                             if(dest>=0) {
                                 if(dest==myIndex)
                                     endRerouting();
@@ -185,7 +212,7 @@ public class ReroutingEventLoopScheduler extends Scheduler {
                                     WorkerQueues.INSTANCE.getWorkerQueue(reroutedQ).rerouteTo(dest, new Action0() {
                                         @Override
                                         public void call() {
-                                            queueCounts.remove(reroutedQ);
+                                            removeQ(reroutedQ);
                                             endRerouting();
                                         }
                                     });
@@ -207,10 +234,11 @@ public class ReroutingEventLoopScheduler extends Scheduler {
                 @Override
                 public void run() {
                     counter++;
-                    if(queueCounts.get(workerQNum) == null) {
-                        queueCounts.put(workerQNum, new AverageOfN());
-                    }
-                    queueCounts.get(workerQNum).add(1L);
+                    Integer qCount = queueCounts.get(workerQNum);
+                    if(qCount == null)
+                        queueCounts.put(workerQNum, new Integer(1));
+                    else
+                        queueCounts.put(workerQNum, qCount + 1);
                     runnable.run();
                 }
             });
@@ -221,19 +249,25 @@ public class ReroutingEventLoopScheduler extends Scheduler {
                 @Override
                 public void run() {
                     counter++;
-                    if(queueCounts.get(workerQNum) == null) {
-                        queueCounts.put(workerQNum, new AverageOfN());
-                    }
-                    queueCounts.get(workerQNum).add(1L);
+                    Integer qCount = queueCounts.get(workerQNum);
+                    if(qCount == null)
+                        queueCounts.put(workerQNum, new Integer(1));
+                    else
+                        queueCounts.put(workerQNum, qCount + 1);
                     runnable.run();
                 }}, delayTime, unit);
+        }
+
+        private void removeQ(long qNumber) {
+            queueCounts.remove(qNumber);
+            queueCountsHistory.remove(qNumber);
         }
 
         void remove(final long workerQNum) {
             executor.submit(new Runnable() {
                 @Override
                 public void run() {
-                    queueCounts.remove(workerQNum);
+                    removeQ(workerQNum);
                 }
             });
         }
@@ -272,8 +306,6 @@ public class ReroutingEventLoopScheduler extends Scheduler {
         private final CompositeSubscription innerSubscription = new CompositeSubscription();
         private volatile CoreThreadWorker transferDest=null;
         private volatile Action0 onTransferComplete=null;
-        private boolean transferInitiated=false;
-        private final List<Action0> transferQueue = new LinkedList<Action0>();
         private final AtomicBoolean transferCompletionReady = new AtomicBoolean(false);
 
         WorkerQueue(long myIndex, CoreThreadWorker worker) {
@@ -283,51 +315,42 @@ public class ReroutingEventLoopScheduler extends Scheduler {
 
         void rerouteTo(int dest, Action0 onComplete) {
             onTransferComplete = onComplete;
-            transferInitiated = false;
             transferDest = CoreThreadWorkers.INSTANCE.CORE_THREAD_WORKERS[dest];
         }
 
-        private void setupReroute() {
-            if(transferInitiated)
-                return;
-            transferInitiated = true;
-            transferQueue.clear();
+        private void awaitReroute() {
             transferCompletionReady.set(false);
             worker.submit(myIndex, new Runnable() {
                 @Override
                 public void run() {
-                    transferCompletionReady.set(true);
+                    synchronized (transferCompletionReady) {
+                        transferCompletionReady.set(true);
+                        transferCompletionReady.notify();
+                    }
                 }
             });
+            while (!transferCompletionReady.get()) {
+                synchronized (transferCompletionReady) {
+                    try {
+                        transferCompletionReady.wait(10);
+                    } catch (InterruptedException e) {}
+                }
+            }
         }
 
-        private void markRerouteComplete() {
-            worker = transferDest;
-            transferDest = null;
-        }
-
-        private boolean rerouteIfNeeded(final Action0 action) {
+        private boolean rerouteIfNeeded() {
             if(transferDest == null)
                 return false;
-            setupReroute();
-            if(transferCompletionReady.get()) {
-                // finish the reroute
-                // ToDo subscriptions need to be managed correctly!!!
-//                for(Action0 a: transferQueue) {
-//                    transferDest.submit(myIndex, a);
-//                }
-                markRerouteComplete();
-                onTransferComplete.call();
-            }
-            else
-                transferQueue.add(action);
+            awaitReroute();
+            worker = transferDest;
+            transferDest = null;
+            onTransferComplete.call();
             return true;
         }
 
         @Override
         public Subscription schedule(final Action0 action) {
-//            if(rerouteIfNeeded(action))
-//                return SomeUsefulSubscription;
+            rerouteIfNeeded();
             final AtomicReference<Subscription> sf = new AtomicReference<Subscription>();
             Subscription s = Subscriptions.from(worker.submit(myIndex, new Runnable() {
                 @Override

@@ -23,13 +23,13 @@ public class ComputationSchedulerPerf {
 
     @GenerateMicroBenchmark
     public void subscribeOn(InputWithIncrementingInteger input) throws InterruptedException {
-        input.observable.subscribeOn(Schedulers.computation()).subscribe(input.observer);
+        input.observable.subscribeOn(new BalancingEventLoopScheduler()).subscribe(input.observer);
         input.awaitCompletion();
     }
 
     @GenerateMicroBenchmark
     public void observeOn(InputWithIncrementingInteger input) throws InterruptedException {
-        input.observable.observeOn(Schedulers.computation()).subscribe(input.observer);
+        input.observable.observeOn(new BalancingEventLoopScheduler()).subscribe(input.observer);
         input.awaitCompletion();
     }
 }

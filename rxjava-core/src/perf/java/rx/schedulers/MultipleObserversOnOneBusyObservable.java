@@ -26,7 +26,7 @@ public class MultipleObserversOnOneBusyObservable {
         for(int o=0; o<input.numObservers; o++) {
             final int foo = o;
             Observable<Integer> theObservable = smallObservable;
-            if(((o+1) % 4) != 0) {
+            if(((o+1) % 4) == 0) {
                 theObservable = bigObservable;
             }
             theObservable
@@ -44,7 +44,7 @@ public class MultipleObserversOnOneBusyObservable {
 
                         @Override
                         public void onNext(Integer integer) {
-                            input.blackHole.consume(integer*integer);
+                            input.blackHole.consume(integer);
                         }
                     });
         }
@@ -53,14 +53,15 @@ public class MultipleObserversOnOneBusyObservable {
 
     @State(Scope.Benchmark)
     public static class Input {
-        private static final int NUM_INTEGERS=5000;
+        @Param({"50", "500", "5000", "50000", "500000"})
+        private int NUM_INTEGERS;
         private final int NUM_CORES = Runtime.getRuntime().availableProcessors();
         private int numObservers;
         private Scheduler[] schedulers;
         private List<Integer> numbers;
         private BlackHole blackHole = new BlackHole();
 
-        @Param({ "0", "1", "2" })
+        @Param({ "0", "2" })
         public int schedulerIndex;
 
         @Setup
@@ -73,6 +74,18 @@ public class MultipleObserversOnOneBusyObservable {
                 numbers.add((int)(Math.random()*1000.0));
         }
 
+
+        @TearDown
+        public void summary() {
+            if(schedulerIndex == 2) {
+                ((ReroutingEventLoopScheduler)schedulers[2]).printStats();
+            }
+            else if(schedulerIndex == 1) {
+                System.out.println("BalancingEventLoopScheduler: #rebalances="+
+                        ((BalancingEventLoopScheduler)schedulers[1]).getNumRebalances());
+            }
+        }
     }
+
 
 }

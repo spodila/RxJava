@@ -100,7 +100,7 @@ subprojects {
     task benchmarks(type: JavaExec) {
         main = 'org.openjdk.jmh.Main'
         classpath = sourceSets.perf.runtimeClasspath + sourceSets.main.output
-        maxHeapSize = "512m"
+        maxHeapSize = "8096m"
 
         if (project.hasProperty('jmh')) {
             args(jmh.split(' '))

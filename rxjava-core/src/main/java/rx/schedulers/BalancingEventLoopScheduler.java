@@ -99,7 +99,7 @@ public class BalancingEventLoopScheduler extends Scheduler {
                             return -1;
                         if(o2.qLoad == 0)
                             return 1;
-                        return Long.compare(o1.totalLoad, o2.totalLoad);
+                        return o1.totalLoad < o2.totalLoad ? -1 : (o1.totalLoad > o2.totalLoad ? 1 : 0);
                     }
                 });
                 boolean allDone=false;
@@ -147,6 +147,7 @@ public class BalancingEventLoopScheduler extends Scheduler {
         private final int myIndex;
         private final List<WorkerQueue> workerQueues = new ArrayList<WorkerQueue>();
         private final int WORK_BUF_SIZE=10;
+        private final int MAX_TIGHT_LOOP = 5000;
         private final List<Action0> workBuffer = new ArrayList<Action0>(WORK_BUF_SIZE);
         private final BlockingQueue<QueueTransferRequest> transferRequests = new LinkedBlockingQueue<QueueTransferRequest>();
         private volatile HotQueue hotQueue;
@@ -177,25 +178,28 @@ public class BalancingEventLoopScheduler extends Scheduler {
                         iterator.remove();
                     }
                     else {
-                        workBuffer.clear();
-                        int w = (wQ.theQueue.peek() == null)? 0 : wQ.theQueue.drainTo(workBuffer, WORK_BUF_SIZE);
-                        if(w > 0) {
-                            now = System.currentTimeMillis();
-                            for(int a=0; a<w; a++) {
-                                try {
-                                    workBuffer.get(a).call();
+                        int tightLoopCount = MAX_TIGHT_LOOP;
+                        do {
+                            workBuffer.clear();
+                            int w = (wQ.theQueue.peek() == null)? 0 : wQ.theQueue.drainTo(workBuffer, WORK_BUF_SIZE);
+                            if(w > 0) {
+                                now = System.currentTimeMillis();
+                                for(int a=0; a<w; a++) {
+                                    try {
+                                        workBuffer.get(a).call();
+                                    }
+                                    catch (Exception e) {} // protect against spurious exception
                                 }
-                                catch (Exception e) {} // protect against spurious exception
+                                long latestLoad = System.currentTimeMillis()-now;
+                                ttlLoad += latestLoad;
+                                if(!hasMoreThanOneQ && iterator.hasNext())
+                                    hasMoreThanOneQ=true;
+                                if(hasMoreThanOneQ && (hq == null || latestLoad>hqLoad)) {
+                                    hq = wQ;
+                                    hqLoad = latestLoad;
+                                }
                             }
-                            long latestLoad = System.currentTimeMillis()-now;
-                            ttlLoad += latestLoad;
-                            if(!hasMoreThanOneQ && iterator.hasNext())
-                                hasMoreThanOneQ=true;
-                            if(hasMoreThanOneQ && (hq == null || latestLoad>hqLoad)) {
-                                hq = wQ;
-                                hqLoad = latestLoad;
-                            }
-                        }
+                        } while (--tightLoopCount > 0);
                     }
                 }
                 if(ttlLoad>0) {
@@ -203,8 +207,6 @@ public class BalancingEventLoopScheduler extends Scheduler {
                 }
                 else {
                     hotQueue = null;
-                    // didn't do any work, sleep some ??
-                    //Thread.yield();
                     synchronized (this) {
                         try{this.wait(0, 50);} catch (InterruptedException ie) {}
                     }
